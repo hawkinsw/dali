@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <assert.h>
 
+#define RESPONSE_MULTIPLE 4096
+static u_char response_contents[RESPONSE_MULTIPLE];
+
 /*
  * flatten_timespec_to_ms
  *
@@ -52,6 +55,12 @@ struct timespec diff_timespec(const struct timespec *older,
     diff.tv_sec--;
   }
   return diff;
+}
+
+static void x_initialize(u_char *buffer, size_t buffer_size) {
+  for (ngx_uint_t index = 0; index<buffer_size; index++) {
+    buffer[index] = 'x';
+  }
 }
 
 /*
@@ -140,12 +149,10 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
       "{\"DurationMS\": %.8f, \"Bytes\": %d, \"BPS\": %d}";
   ngx_uint_t status = NGX_HTTP_OK;
   ngx_uint_t ngx_rc = NGX_OK;
-  ngx_buf_t *response_b = NULL;
-  ngx_chain_t output_chain;
-  u_char *memory = NULL;
   struct timespec before_ts, after_ts;
   u_char *response_json = NULL;
   size_t response_json_len = 0;
+  ngx_chain_t *output_chain_head = NULL;
 
   r->headers_out.content_type.len = content_type_len;
   r->headers_out.content_type.data = content_type;
@@ -212,38 +219,58 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
       ngx_snprintf(response_json, response_json_len, response_json_template,
                    body_read_duration, body_read_size, 0);
     }
-  }
 
-  if (conf && ngx_rc == NGX_OK) {
-    /*
-     * We could fail to allocate enough memory for the response.
-     */
-    memory = ngx_pcalloc(r->pool,
-                         sizeof(u_char) * (conf->length + response_json_len));
-    if (!memory) {
-      ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                    "Dali failed to allocate %d bytes space for response.",
-                    conf->length + response_json_len);
+    ngx_chain_t *output_chain_iterator = NULL;
+    for (size_t index = 0; index<conf->length; index++) {
+      
+      ngx_buf_t *response_buffer = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+      if (!response_buffer) {
+        ngx_log_error(
+            NGX_LOG_CRIT, r->connection->log, 0,
+            "Dali failed to allocate memory for a response buffer manager");
+        // We don't have to worry about freeing memory here -- everything
+        // was pool allocated so nginx will clean up after us.
+        output_chain_head = NULL;
+        break;
+      }
+      response_buffer->memory = 1;
+
+      // Special case handling for the first response frame.
+      if (index == 0) {
+        ngx_log_error(
+            NGX_LOG_CRIT, r->connection->log, 0,
+            "Dali building first output chain entry.");
+        output_chain_head = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
+        output_chain_iterator = output_chain_head;
+
+        size_t first_output_len = RESPONSE_MULTIPLE + response_json_len;
+        u_char *first_output_buffer = ngx_pcalloc(r->pool, sizeof(u_char) * first_output_len);
+        ngx_log_error(
+            NGX_LOG_CRIT, r->connection->log, 0,
+            "first_output_len: %d.", first_output_len);
+        x_initialize(first_output_buffer, first_output_len);
+        ngx_memcpy(first_output_buffer, response_json, response_json_len);
+        response_buffer->pos = first_output_buffer;
+        response_buffer->last = first_output_buffer + first_output_len;
+      } else {
+        ngx_log_error(
+            NGX_LOG_CRIT, r->connection->log, 0,
+            "Dali building %d st/nd output chain entry.", (index + 1));
+        ngx_chain_t *previous_chain = output_chain_iterator;
+        output_chain_iterator = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
+        previous_chain->next = output_chain_iterator;
+        response_buffer->pos = response_contents;
+        response_buffer->last = response_contents + RESPONSE_MULTIPLE;
+      }
+      response_buffer->last_buf = (index+1) == conf->length ? 1 : 0;
+      output_chain_iterator->buf = response_buffer;
     }
-  }
 
-  if (conf && ngx_rc == NGX_OK && memory) {
-    /*
-     * We could fail to allocate enough memory to allocate
-     * a structure to tell nginx how to manage our response.
-     */
-    response_b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
-    if (!response_b) {
-      ngx_log_error(
-          NGX_LOG_CRIT, r->connection->log, 0,
-          "Dali failed to allocate memory for a response buffer manager");
-    }
   }
-
   /*
    * If any of those failures happened, bail out.
    */
-  if (!conf || ngx_rc > NGX_OK || !memory || !response_b) {
+  if (!conf || ngx_rc > NGX_OK || !output_chain_head) {
     status = NGX_HTTP_INTERNAL_SERVER_ERROR;
     r->headers_out.status = status;
     r->headers_out.content_length_n = 0;
@@ -251,37 +278,20 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
     return NGX_ERROR;
   }
 
-  /*
-   * Now that we have handled (almost) all the possible error conditions,
-   * we can get down to work.
-   */
-  output_chain.buf = NULL;
-  output_chain.next = NULL;
-
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Dali module responding");
-
-  /*
-   * Put the json response at the front of the response.
-   */
-  ngx_memcpy(memory, response_json, response_json_len);
 
   /*
    * Configure the response "buffer" appropriately.
    */
-  response_b->pos = memory;
-  response_b->last = memory + conf->length + response_json_len;
-  response_b->memory = 1;
-  response_b->last_buf = 1;
-  output_chain.buf = response_b;
 
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                "Dali sending a %d byte response", conf->length);
+                "Dali sending a %d byte response", conf->length * RESPONSE_MULTIPLE);
 
   /*
    * Setup some values for the header of our response.
    */
   r->headers_out.content_length_n =
-      sizeof(u_char) * (conf->length + response_json_len);
+      sizeof(u_char) * ((conf->length*RESPONSE_MULTIPLE) + response_json_len);
   r->headers_out.status = status;
 
   /*
@@ -298,7 +308,7 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
    * Kick off the nginx processing chain that will ultimately
    * send our response body back to the user.
    */
-  return ngx_http_output_filter(r, &output_chain);
+  return ngx_http_output_filter(r, output_chain_head);
 }
 
 /*
@@ -345,6 +355,14 @@ static char *ngx_http_dali_merge_conf(ngx_conf_t *cf, void *parent,
   ngx_http_dali_conf_t *prev = parent;
   ngx_http_dali_conf_t *conf = child;
 
+  size_t conf_len = conf->length;
+
+  conf->length = 0;
+  if (conf_len % RESPONSE_MULTIPLE != 0) {
+    conf->length = 1;
+  }
+  conf->length += conf_len / RESPONSE_MULTIPLE;
+
   /* We always want to inherit the smaller size in nested configurations.
    */
   if (prev->length > 0 && prev->length < conf->length) {
@@ -371,6 +389,11 @@ static char *ngx_http_dali_enable(ngx_conf_t *cf, ngx_command_t *cmd,
                                   void *conf) {
   ngx_http_core_loc_conf_t *clcf;
   clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+  /*
+   * Initialize the response buffer to all xs
+   */
+  x_initialize(response_contents, RESPONSE_MULTIPLE);
   /*
    * Tell nginx that this dali module is going to handle requests that
    * get matched to the location being configured! This is key!
