@@ -14,55 +14,6 @@
 #include <stdio.h>
 #include <assert.h>
 
-#define RESPONSE_MULTIPLE 4096
-static u_char response_contents[RESPONSE_MULTIPLE];
-
-/*
- * flatten_timespec_to_ms
- *
- * This function will flatten a `struct timespec` (which consists
- * of a number of seconds and a number of nanoseconds) in to a single
- * value (measured in microseconds).
- *
- * Input: The timespec that contains the value to convert.
- * Output: The "same" timespec, but as a single value (in microseconds)
- */
-long double flatten_timespec_to_ms(const struct timespec *ts) {
-  return ((long double)((ts->tv_sec * 1e9) + ts->tv_nsec)) / 0.001;
-}
-
-/*
- * diff_timespec
- *
- * Subtract one `struct timespec` from another. The one with the
- * "bigger" value must come after the one with the "smaller" value.
- * The parameter names (older and newer) should make the point clear.
- *
- * Input: Two `struct timespec` values to subtract from one another.
- * Output: A `struct timespec` that is the difference between the two
- * given as inputs.
- *
- * The implementation was Shamelessly taken from (and slightly modified):
- * https://stackoverflow.com/questions/68804469/subtract-two-timespec-objects-find-difference-in-time-or-duration
- */
-struct timespec diff_timespec(const struct timespec *older,
-                              const struct timespec *newer) {
-  assert(older->tv_sec <= newer->tv_sec);
-  struct timespec diff = {.tv_sec = newer->tv_sec - older->tv_sec,
-                          .tv_nsec = newer->tv_nsec - older->tv_nsec};
-  if (diff.tv_nsec < 0) {
-    diff.tv_nsec += 1000000000;
-    diff.tv_sec--;
-  }
-  return diff;
-}
-
-static void x_initialize(u_char *buffer, size_t buffer_size) {
-  for (ngx_uint_t index = 0; index<buffer_size; index++) {
-    buffer[index] = 'x';
-  }
-}
-
 /*
  * The data structure that holds the configuration that the user
  * provides for the Dali module.
@@ -148,7 +99,10 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   ngx_uint_t status = NGX_HTTP_OK;
   ngx_int_t ngx_discard_rc = NGX_OK;
   ngx_int_t ngx_send_header_rc = NGX_OK;
-  ngx_chain_t *output_chain_head = NULL;
+  ngx_chain_t *output_chain = NULL;
+  ngx_buf_t *buffer = NULL;
+  ngx_fd_t zero_file;
+  ngx_str_t zero_file_path;
 
   r->headers_out.content_type.len = content_type_len;
   r->headers_out.content_type.data = content_type;
@@ -168,65 +122,50 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
     ngx_log_error(
         NGX_LOG_CRIT, r->connection->log, 0,
         "Dali could not access configuration data when handling a request");
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  if (conf) {
-    ngx_discard_rc = ngx_http_discard_request_body(r);
-    if (ngx_discard_rc > NGX_OK) {
-      ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                    "Dali could not read and discard the request's body");
-    }
-  }
- 
-  if (conf && ngx_discard_rc == NGX_OK) {
-    ngx_chain_t *output_chain_iterator = NULL;
-    for (size_t index = 0; index<conf->length; index++) {
-      
-      ngx_buf_t *response_buffer = ngx_calloc_buf(r->pool);
-      if (!response_buffer) {
-        ngx_log_error(
-            NGX_LOG_CRIT, r->connection->log, 0,
-            "Dali failed to allocate memory for a response buffer manager");
-        // We don't have to worry about freeing memory here -- everything
-        // was pool allocated so nginx will clean up after us.
-        output_chain_head = NULL;
-        break;
-      }
-      response_buffer->memory = 1;
-      ngx_chain_t *new_ngx_chain = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
-
-      // Special case handling for the first response frame.
-      if (index == 0) {
-        ngx_log_error(
-            NGX_LOG_DEBUG, r->connection->log, 0,
-            "Dali building first output chain entry.");
-        output_chain_head = new_ngx_chain;
-        output_chain_iterator = output_chain_head;
-      } else {
-        ngx_log_error(
-            NGX_LOG_DEBUG, r->connection->log, 0,
-            "Dali building %d st/nd output chain entry.", (index + 1));
-        ngx_chain_t *previous_chain = output_chain_iterator;
-        output_chain_iterator = new_ngx_chain;
-        previous_chain->next = output_chain_iterator;
-      }
-      response_buffer->pos = response_contents;
-      response_buffer->last = response_contents + RESPONSE_MULTIPLE;
-      response_buffer->last_buf = (index+1) == conf->length ? 1 : 0;
-      output_chain_iterator->buf = response_buffer;
-    }
+  ngx_discard_rc = ngx_http_discard_request_body(r);
+  if (ngx_discard_rc > NGX_OK) {
+    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+                  "Dali could not read and discard the request's body");
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  /*
-   * If any of those failures happened, bail out.
-   */
-  if (!conf || ngx_discard_rc > NGX_OK || !output_chain_head) {
-    status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-    r->headers_out.status = status;
-    r->headers_out.content_length_n = 0;
-    ngx_http_send_header(r);
-    return status;
+  output_chain = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
+  buffer = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+  buffer->file = ngx_pcalloc(r->pool, sizeof(ngx_file_t));
+  zero_file_path.len = ngx_strlen("/dev/zero") + 1;
+  zero_file_path.data = ngx_pnalloc(r->pool, zero_file_path.len);
+
+  if (!output_chain || !buffer || !buffer->file || !zero_file_path.data) {
+    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+                  "Dali could not allocate memory for meta structures");
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
+
+  ngx_cpystrn(zero_file_path.data, (u_char*)"/dev/zero", zero_file_path.len);
+  zero_file = ngx_open_file(zero_file_path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+  if (zero_file == NGX_INVALID_FILE) {
+    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0, "Dali could not open /dev/zero");
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+  buffer->file_pos = 0;
+  buffer->file_last = conf->length;
+  buffer->in_file = 1;
+  buffer->last_buf = 1;
+  buffer->last_in_chain = 1;
+
+  buffer->file->fd = zero_file;
+  buffer->file->name = zero_file_path;
+  buffer->file->log = r->connection->log;
+  buffer->file->directio = false;
+
+  output_chain->buf = buffer;
+  output_chain->next = NULL;
+
+  /* sendfile does not work with character device files. Disable. */
+  r->connection->sendfile = 0;
 
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Dali module responding");
 
@@ -235,13 +174,13 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
    */
 
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                "Dali sending a %d byte response", conf->length * RESPONSE_MULTIPLE);
+                "Dali sending a %d byte response", conf->length);
 
   /*
    * Setup some values for the header of our response.
    */
   r->headers_out.content_length_n =
-      sizeof(u_char) * (conf->length*RESPONSE_MULTIPLE);
+      sizeof(u_char) * (conf->length);
   r->headers_out.status = status;
 
   /*
@@ -254,6 +193,7 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
     return ngx_send_header_rc;
   }
 
+  r->allow_ranges = 1;
   if (ngx_send_header_rc > NGX_OK || r->header_only) {
     return ngx_send_header_rc;
   }
@@ -262,7 +202,7 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
    * Kick off the nginx processing chain that will ultimately
    * send our response body back to the user.
    */
-  return ngx_http_output_filter(r, output_chain_head);
+  return ngx_http_output_filter(r, output_chain);
 }
 
 /*
@@ -312,14 +252,6 @@ static char *ngx_http_dali_merge_conf(ngx_conf_t *cf, void *parent,
   ngx_http_dali_conf_t *prev = parent;
   ngx_http_dali_conf_t *conf = child;
 
-  size_t conf_len = conf->length;
-
-  conf->length = 0;
-  if (conf_len % RESPONSE_MULTIPLE != 0) {
-    conf->length = 1;
-  }
-  conf->length += conf_len / RESPONSE_MULTIPLE;
-
   /* We always want to inherit the smaller size in nested configurations.
    */
   if (prev->length > 0 && prev->length < conf->length) {
@@ -352,11 +284,6 @@ static char *ngx_http_dali_enable(ngx_conf_t *cf, ngx_command_t *cmd,
   // in order to make this module implementation work out properly. In other
   // words, don't think too deeply about it.
   clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-
-  /*
-   * Initialize the response buffer to all xs
-   */
-  x_initialize(response_contents, RESPONSE_MULTIPLE);
   /*
    * Tell nginx that this dali module is going to handle requests that
    * get matched to the location being configured! This is key!
