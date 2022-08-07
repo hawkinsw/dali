@@ -10,9 +10,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <assert.h>
 
 /*
  * The data structure that holds the configuration that the user
@@ -40,8 +40,7 @@ static char *ngx_http_dali_enable(ngx_conf_t *, ngx_command_t *, void *);
 static ngx_command_t ngx_http_dali_commands[] = {
     {ngx_string("dali"), NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
      ngx_http_dali_enable, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL},
-    ngx_null_command
-};
+    ngx_null_command};
 
 /*
  * This struct will be used to tell nginx which of its
@@ -94,25 +93,15 @@ ngx_module_t ngx_http_dali_module = {
  */
 static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   ngx_http_dali_conf_t *conf = NULL;
-  u_char *content_type = (u_char *)"application/octet-stream";
-  size_t content_type_len = ngx_strlen(content_type);
   ngx_uint_t status = NGX_HTTP_OK;
   ngx_int_t ngx_discard_rc = NGX_OK;
   ngx_int_t ngx_send_header_rc = NGX_OK;
   ngx_chain_t *output_chain = NULL;
   ngx_buf_t *buffer = NULL;
-  ngx_fd_t zero_file;
-  ngx_str_t zero_file_path;
+  ngx_fd_t dev_zero_fd;
+  ngx_str_t dev_zero_path;
 
-  r->headers_out.content_type.len = content_type_len;
-  r->headers_out.content_type.data = content_type;
-
-  /*
-   * The code in the next section is a little goofy looking:
-   * I am trying to collect the error-handling code in a single
-   * spot and there are three (3) different ways that an error
-   * could occur.
-   */
+  ngx_str_set(&r->headers_out.content_type, "application/octet-stream");
 
   /*
    * We could fail to read the module configuration.
@@ -125,6 +114,9 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
+  /*
+   * We could fail to read/discard the request's body!
+   */
   ngx_discard_rc = ngx_http_discard_request_body(r);
   if (ngx_discard_rc > NGX_OK) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
@@ -132,32 +124,39 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
+  /*
+   * We could fail to allocate space required for the meta structures.
+   */
   output_chain = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
   buffer = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
   buffer->file = ngx_pcalloc(r->pool, sizeof(ngx_file_t));
-  zero_file_path.len = ngx_strlen("/dev/zero") + 1;
-  zero_file_path.data = ngx_pnalloc(r->pool, zero_file_path.len);
 
-  if (!output_chain || !buffer || !buffer->file || !zero_file_path.data) {
+  if (!output_chain || !buffer || !buffer->file) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                   "Dali could not allocate memory for meta structures");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  ngx_cpystrn(zero_file_path.data, (u_char*)"/dev/zero", zero_file_path.len);
-  zero_file = ngx_open_file(zero_file_path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-  if (zero_file == NGX_INVALID_FILE) {
-    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0, "Dali could not open /dev/zero");
+  ngx_str_set(&dev_zero_path, "/dev/zero");
+  dev_zero_fd =
+      ngx_open_file(dev_zero_path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+  if (dev_zero_fd == NGX_INVALID_FILE) {
+    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+                  "Dali could not open /dev/zero");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
+
+  /*
+   * Configure the response buffer and chain appropriately.
+   */
   buffer->file_pos = 0;
   buffer->file_last = conf->length;
   buffer->in_file = 1;
   buffer->last_buf = 1;
   buffer->last_in_chain = 1;
 
-  buffer->file->fd = zero_file;
-  buffer->file->name = zero_file_path;
+  buffer->file->fd = dev_zero_fd;
+  buffer->file->name = dev_zero_path;
   buffer->file->log = r->connection->log;
   buffer->file->directio = false;
 
@@ -169,18 +168,13 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
 
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Dali module responding");
 
-  /*
-   * Configure the response "buffer" appropriately.
-   */
-
   ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
                 "Dali sending a %d byte response", conf->length);
 
   /*
    * Setup some values for the header of our response.
    */
-  r->headers_out.content_length_n =
-      sizeof(u_char) * (conf->length);
+  r->headers_out.content_length_n = (conf->length);
   r->headers_out.status = status;
 
   /*
@@ -266,8 +260,8 @@ static char *ngx_http_dali_merge_conf(ngx_conf_t *cf, void *parent,
  * This function is invoked by nginx when it sees a `dali`
  * directive in the configuration file.
  *
- * Input: The overall server configuration 
- *        The text of the raw configuration command being processed 
+ * Input: The overall server configuration
+ *        The text of the raw configuration command being processed
  *        A pointer to the extra information specified for this
  *        callback above (see ngx_http_dali_commands).
  * Output: The result of processing the command (indirectly through
