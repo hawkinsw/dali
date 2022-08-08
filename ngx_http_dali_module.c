@@ -96,7 +96,19 @@ ngx_module_t ngx_http_dali_module = {
     NULL,                      /* exit master */
     NGX_MODULE_V1_PADDING};
 
-static void dali_client_body_fetched_handler(ngx_http_request_t *r) {
+
+/*
+ * This callback function will be invoked when the pool
+ * associated with the connection is cleaned up.
+ *
+ * See (below) for where/how it is installed.
+ */
+static void ngx_http_dali_cleanup(void *data) {
+  ngx_http_dali_ctx_t *dali_ctx = (ngx_http_dali_ctx_t*)data;
+  ngx_close_file(dali_ctx->dev_zero_fd);
+}
+
+static void ngx_http_dali_client_body_fetched_handler(ngx_http_request_t *r) {
   ngx_int_t ngx_send_header_rc = NGX_OK;
   ngx_http_dali_ctx_t *dali_ctx = NULL;
 
@@ -136,6 +148,7 @@ static void dali_client_body_fetched_handler(ngx_http_request_t *r) {
    */
   ngx_http_output_filter(r, dali_ctx->output_chain);
 }
+
 /*
  * ngx_http_dali_handler
  *
@@ -149,6 +162,7 @@ static void dali_client_body_fetched_handler(ngx_http_request_t *r) {
 static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   ngx_http_dali_conf_t *conf = NULL;
   ngx_http_dali_ctx_t *dali_ctx = NULL;
+  ngx_pool_cleanup_t  *cln;
 
   dali_ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dali_ctx_t));
   if (!dali_ctx) {
@@ -197,6 +211,19 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   }
 
   /*
+   * Install a handler that will run when the pool 
+   * associated with this request is cleansed. This
+   * will give us the chance to close the file handle
+   * that we opened!
+   */
+  cln = ngx_pool_cleanup_add(r->pool, 0);
+  if (!cln) {
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+  cln->handler = ngx_http_dali_cleanup;
+  cln->data = dali_ctx;
+
+  /*
    * Configure the response buffer and chain appropriately.
    */
   dali_ctx->buffer->file_pos = 0;
@@ -215,7 +242,7 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
 
   ngx_http_set_ctx(r, dali_ctx, ngx_http_dali_module);
 
-  return ngx_http_read_client_request_body(r, dali_client_body_fetched_handler);
+  return ngx_http_read_client_request_body(r, ngx_http_dali_client_body_fetched_handler);
 }
 
 /*
