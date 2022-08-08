@@ -6,6 +6,9 @@
  * Copyright (C) Kirill A. Korinskiy
  */
 
+// Turn off clang-format here so that it does not rearrange include
+// files. Order matters in nginx world.
+// clang-format off
 #include <nginx.h>
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -13,6 +16,8 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+// clang-format on
+// Turn clang-format back on.
 
 /*
  * The data structure that holds the configuration that the user
@@ -20,9 +25,19 @@
  *
  * There is only one customizable value.
  */
-typedef struct {
+struct ngx_http_dali_conf_s {
   size_t length;
-} ngx_http_dali_conf_t;
+};
+typedef struct ngx_http_dali_conf_s ngx_http_dali_conf_t;
+
+struct ngx_http_dali_ctx_s {
+  size_t       length;
+  ngx_str_t    dev_zero_path;
+  ngx_fd_t     dev_zero_fd;
+  ngx_buf_t   *buffer;
+  ngx_chain_t *output_chain;
+};
+typedef struct ngx_http_dali_ctx_s ngx_http_dali_ctx_t;
 
 /*
  * Declare some functions that will do the real work of
@@ -81,6 +96,46 @@ ngx_module_t ngx_http_dali_module = {
     NULL,                      /* exit master */
     NGX_MODULE_V1_PADDING};
 
+static void dali_client_body_fetched_handler(ngx_http_request_t *r) {
+  ngx_int_t ngx_send_header_rc = NGX_OK;
+  ngx_http_dali_ctx_t *dali_ctx = NULL;
+
+  dali_ctx = ngx_http_get_module_ctx(r, ngx_http_dali_module);
+  if (!dali_ctx) {
+    ngx_log_error(
+        NGX_LOG_CRIT, r->connection->log, 0,
+        "Dali could not retrieve the Dali context");
+    return;
+  }
+
+  ngx_str_set(&r->headers_out.content_type, "application/octet-stream");
+
+  ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Dali module responding");
+
+  ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                "Dali sending a %d byte response", dali_ctx->length);
+
+  r->headers_out.content_length_n = dali_ctx->length;
+  r->headers_out.status = NGX_HTTP_OK;
+  r->connection->sendfile = 0;
+
+  ngx_send_header_rc = ngx_http_send_header(r);
+  if (ngx_send_header_rc == NGX_ERROR) {
+    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+                  "Dali could not send the response header");
+    return;
+  }
+
+  if (ngx_send_header_rc > NGX_OK || r->header_only) {
+    return;
+  }
+
+  /*
+   * Kick off the nginx processing chain that will ultimately
+   * send our response body back to the user.
+   */
+  ngx_http_output_filter(r, dali_ctx->output_chain);
+}
 /*
  * ngx_http_dali_handler
  *
@@ -93,15 +148,19 @@ ngx_module_t ngx_http_dali_module = {
  */
 static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   ngx_http_dali_conf_t *conf = NULL;
-  ngx_uint_t status = NGX_HTTP_OK;
-  ngx_int_t ngx_discard_rc = NGX_OK;
-  ngx_int_t ngx_send_header_rc = NGX_OK;
-  ngx_chain_t *output_chain = NULL;
-  ngx_buf_t *buffer = NULL;
-  ngx_fd_t dev_zero_fd;
-  ngx_str_t dev_zero_path;
+  ngx_http_dali_ctx_t *dali_ctx = NULL;
 
-  ngx_str_set(&r->headers_out.content_type, "application/octet-stream");
+  dali_ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dali_ctx_t));
+  if (!dali_ctx) {
+    ngx_log_error(
+        NGX_LOG_CRIT, r->connection->log, 0,
+        "Dali could not allocate a Dali context");
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+
+  /*
+   * ngx_pcalloc sets all to 0/NULL.
+   */
 
   /*
    * We could fail to read the module configuration.
@@ -113,34 +172,25 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
         "Dali could not access configuration data when handling a request");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
-
-  /*
-   * We could fail to read/discard the request's body!
-   */
-  ngx_discard_rc = ngx_http_discard_request_body(r);
-  if (ngx_discard_rc > NGX_OK) {
-    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                  "Dali could not read and discard the request's body");
-    return NGX_HTTP_INTERNAL_SERVER_ERROR;
-  }
+  dali_ctx->length = conf->length;
 
   /*
    * We could fail to allocate space required for the meta structures.
    */
-  output_chain = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
-  buffer = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
-  buffer->file = ngx_pcalloc(r->pool, sizeof(ngx_file_t));
+  dali_ctx->output_chain = ngx_pcalloc(r->pool, sizeof(ngx_chain_t));
+  dali_ctx->buffer = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+  dali_ctx->buffer->file = ngx_pcalloc(r->pool, sizeof(ngx_file_t));
 
-  if (!output_chain || !buffer || !buffer->file) {
+  if (!dali_ctx->output_chain || !dali_ctx->buffer || !dali_ctx->buffer->file) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                   "Dali could not allocate memory for meta structures");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
   }
 
-  ngx_str_set(&dev_zero_path, "/dev/zero");
-  dev_zero_fd =
-      ngx_open_file(dev_zero_path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-  if (dev_zero_fd == NGX_INVALID_FILE) {
+  ngx_str_set(&dali_ctx->dev_zero_path, "/dev/zero");
+  dali_ctx->dev_zero_fd =
+      ngx_open_file(dali_ctx->dev_zero_path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+  if (dali_ctx->dev_zero_fd == NGX_INVALID_FILE) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                   "Dali could not open /dev/zero");
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -149,54 +199,23 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   /*
    * Configure the response buffer and chain appropriately.
    */
-  buffer->file_pos = 0;
-  buffer->file_last = conf->length;
-  buffer->in_file = 1;
-  buffer->last_buf = 1;
-  buffer->last_in_chain = 1;
+  dali_ctx->buffer->file_pos = 0;
+  dali_ctx->buffer->file_last = conf->length;
+  dali_ctx->buffer->in_file = 1;
+  dali_ctx->buffer->last_buf = 1;
+  dali_ctx->buffer->last_in_chain = 1;
 
-  buffer->file->fd = dev_zero_fd;
-  buffer->file->name = dev_zero_path;
-  buffer->file->log = r->connection->log;
-  buffer->file->directio = false;
+  dali_ctx->buffer->file->fd = dali_ctx->dev_zero_fd;
+  dali_ctx->buffer->file->name = dali_ctx->dev_zero_path;
+  dali_ctx->buffer->file->log = r->connection->log;
+  dali_ctx->buffer->file->directio = false;
 
-  output_chain->buf = buffer;
-  output_chain->next = NULL;
+  dali_ctx->output_chain->buf = dali_ctx->buffer;
+  dali_ctx->output_chain->next = NULL;
 
-  /* sendfile does not work with character device files. Disable. */
-  r->connection->sendfile = 0;
+  ngx_http_set_ctx(r, dali_ctx, ngx_http_dali_module);
 
-  ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "Dali module responding");
-
-  ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
-                "Dali sending a %d byte response", conf->length);
-
-  /*
-   * Setup some values for the header of our response.
-   */
-  r->headers_out.content_length_n = (conf->length);
-  r->headers_out.status = status;
-
-  /*
-   * Send the headers of the response.
-   */
-  ngx_send_header_rc = ngx_http_send_header(r);
-  if (ngx_send_header_rc == NGX_ERROR) {
-    ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                  "Dali could not send the response header");
-    return ngx_send_header_rc;
-  }
-
-  r->allow_ranges = 1;
-  if (ngx_send_header_rc > NGX_OK || r->header_only) {
-    return ngx_send_header_rc;
-  }
-
-  /*
-   * Kick off the nginx processing chain that will ultimately
-   * send our response body back to the user.
-   */
-  return ngx_http_output_filter(r, output_chain);
+  return ngx_http_read_client_request_body(r, dali_client_body_fetched_handler);
 }
 
 /*
