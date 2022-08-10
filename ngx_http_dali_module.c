@@ -117,6 +117,7 @@ static void ngx_http_dali_client_body_fetched_handler(ngx_http_request_t *r) {
     ngx_log_error(
         NGX_LOG_CRIT, r->connection->log, 0,
         "Dali could not retrieve the Dali context");
+    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
     return;
   }
 
@@ -135,10 +136,12 @@ static void ngx_http_dali_client_body_fetched_handler(ngx_http_request_t *r) {
   if (ngx_send_header_rc == NGX_ERROR) {
     ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                   "Dali could not send the response header");
+    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
     return;
   }
 
   if (ngx_send_header_rc > NGX_OK || r->header_only) {
+    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
     return;
   }
 
@@ -146,7 +149,7 @@ static void ngx_http_dali_client_body_fetched_handler(ngx_http_request_t *r) {
    * Kick off the nginx processing chain that will ultimately
    * send our response body back to the user.
    */
-  ngx_http_output_filter(r, dali_ctx->output_chain);
+  ngx_http_finalize_request(r, ngx_http_output_filter(r, dali_ctx->output_chain));
 }
 
 /*
