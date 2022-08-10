@@ -166,6 +166,7 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
   ngx_http_dali_conf_t *conf = NULL;
   ngx_http_dali_ctx_t *dali_ctx = NULL;
   ngx_pool_cleanup_t  *cln;
+  ngx_int_t ngx_rc = NGX_OK;
 
   dali_ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_dali_ctx_t));
   if (!dali_ctx) {
@@ -245,7 +246,12 @@ static ngx_int_t ngx_http_dali_handler(ngx_http_request_t *r) {
 
   ngx_http_set_ctx(r, dali_ctx, ngx_http_dali_module);
 
-  return ngx_http_read_client_request_body(r, ngx_http_dali_client_body_fetched_handler);
+  ngx_rc = ngx_http_read_client_request_body(r, ngx_http_dali_client_body_fetched_handler);
+
+  if (ngx_rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+    return ngx_rc;
+  }
+  return NGX_DONE;
 }
 
 /*
